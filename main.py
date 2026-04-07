@@ -19,6 +19,18 @@ from portfolio import allocate_portfolio, compute_asset_correlation
 
 SIGNAL_NAME = {0: "BUY", 1: "SELL", 2: "HOLD"}
 
+# Runtime-focused defaults to keep end-to-end execution practical on local machines.
+DATA_START = "2021-01-01"
+DATA_END = "2024-12-31"
+TIME_STEPS = 32
+OUTLIER_FIT_EPOCHS = 12
+OUTLIER_FIT_BATCH = 128
+KMEANS_CLUSTERS = 12
+MODEL_EPOCHS = 10
+SHAP_BACKGROUND_MAX = 20
+SHAP_NSAMPLES = 30
+CORR_LOOKBACK = 200
+
 
 def set_reproducibility(seed: int = 42) -> None:
     """Set random seeds for reproducibility across NumPy and TensorFlow."""
@@ -84,7 +96,7 @@ def run_pipeline_collect() -> dict:
     """Execute ExplainInvest and return structured results for downstream UIs/APIs."""
     set_reproducibility(42)
 
-    dataset = collect_and_preprocess_data(start="2018-01-01", end="2024-12-31", time_steps=48)
+    dataset = collect_and_preprocess_data(start=DATA_START, end=DATA_END, time_steps=TIME_STEPS)
     split_data = split_train_test_by_asset(dataset, train_ratio=0.8)
 
     X_train = split_data["X_train"]
@@ -93,7 +105,11 @@ def run_pipeline_collect() -> dict:
         input_dim=X_train.shape[1] * X_train.shape[2],
         contamination=0.05,
     )
-    detector.fit(X_train.reshape(X_train.shape[0], -1))
+    detector.fit(
+        X_train.reshape(X_train.shape[0], -1),
+        epochs=OUTLIER_FIT_EPOCHS,
+        batch_size=OUTLIER_FIT_BATCH,
+    )
 
     train_outliers = detector.detect(
         X_train.reshape(X_train.shape[0], -1),
@@ -105,7 +121,7 @@ def run_pipeline_collect() -> dict:
         current_close=split_data["current_train"],
         next_close=split_data["next_train"],
         clean_mask=~train_outliers.combined_flag,
-        n_clusters=25,
+        n_clusters=KMEANS_CLUSTERS,
         move_threshold=0.00005,
     )
 
@@ -130,7 +146,7 @@ def run_pipeline_collect() -> dict:
         model=model,
         X_train=X_train_clean,
         y_train=y_train_clean,
-        epochs=50,
+        epochs=MODEL_EPOCHS,
         batch_size=32,
         validation_split=0.2,
         class_weight=class_weight_dict,
@@ -144,7 +160,7 @@ def run_pipeline_collect() -> dict:
     asset_outlier: Dict[str, bool] = {}
     per_asset_top_features: Dict[str, List[str]] = {}
 
-    background_count = min(80, len(X_train_clean))
+    background_count = min(SHAP_BACKGROUND_MAX, len(X_train_clean))
     if background_count < 5:
         raise RuntimeError("Not enough clean training samples for SHAP background.")
     background_data = X_train_clean[
@@ -157,11 +173,10 @@ def run_pipeline_collect() -> dict:
         latest_atr = payload["latest_atr"]
 
         asset_full = dataset["assets"][asset_name]
-        asset_outlier_result = detector.detect(
-            asset_full.X.reshape(asset_full.X.shape[0], -1),
-            asset_full.atr,
-        )
-        last_outlier_flag = bool(asset_outlier_result.combined_flag[-1])
+        latest_flat = asset_full.X[-1:].reshape(1, -1)
+        latest_atr_arr = np.asarray([asset_full.atr[-1]], dtype=np.float32)
+        asset_outlier_result = detector.detect(latest_flat, latest_atr_arr)
+        last_outlier_flag = bool(asset_outlier_result.combined_flag[0])
 
         pred_label, _, pred_conf = predict_signals(model, X_latest)
         signal = int(pred_label[0])
@@ -177,7 +192,7 @@ def run_pipeline_collect() -> dict:
             predicted_class=signal,
             latest_feature_values=payload["latest_features"],
             top_k=5,
-            nsamples=120,
+            nsamples=SHAP_NSAMPLES,
         )
         per_asset_top_features[asset_name] = format_top_features(
             top_features, SIGNAL_NAME[signal]
@@ -187,7 +202,7 @@ def run_pipeline_collect() -> dict:
         asset_name: dataset["assets"][asset_name].raw_df["Close"]
         for asset_name in dataset["assets"].keys()
     }
-    corr_matrix = compute_asset_correlation(close_series_map, lookback=500)
+    corr_matrix = compute_asset_correlation(close_series_map, lookback=CORR_LOOKBACK)
 
     weights = allocate_portfolio(
         asset_signals=asset_signals,
