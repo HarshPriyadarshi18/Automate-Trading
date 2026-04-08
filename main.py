@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 from sklearn.utils.class_weight import compute_class_weight
 
@@ -26,16 +29,67 @@ TIME_STEPS = 32
 OUTLIER_FIT_EPOCHS = 12
 OUTLIER_FIT_BATCH = 128
 KMEANS_CLUSTERS = 12
-MODEL_EPOCHS = 10
+MODEL_EPOCHS = 5
 SHAP_BACKGROUND_MAX = 20
 SHAP_NSAMPLES = 30
 CORR_LOOKBACK = 200
+PREFERRED_MARKETS = [
+    "BTC-USD",
+    "ETH-USD",
+    "XRP-USD",
+    "S&P500",
+    "NASDAQ",
+    "Dow Jones",
+    "Apple",
+    "Microsoft",
+    "NVIDIA",
+    "Tesla",
+    "Gold",
+    "Silver",
+    "Crude Oil",
+    "Natural Gas",
+    "EUR/USD",
+    "GBP/USD",
+]
+MARKET_COUNT = 16
+REPORT_DIR = Path("reports")
 
 
 def set_reproducibility(seed: int = 42) -> None:
     """Set random seeds for reproducibility across NumPy and TensorFlow."""
     np.random.seed(seed)
     tf.random.set_seed(seed)
+
+
+def pick_market_universe(asset_names: List[str], preferred_markets: List[str], count: int) -> List[str]:
+    """Pick up to `count` assets, prioritizing preferred markets if available."""
+    selected: List[str] = []
+
+    for market in preferred_markets:
+        if market in asset_names and market not in selected:
+            selected.append(market)
+        if len(selected) == count:
+            return selected
+
+    for market in sorted(asset_names):
+        if market not in selected:
+            selected.append(market)
+        if len(selected) == count:
+            break
+
+    return selected
+
+
+def filter_dataset_assets(dataset: dict, selected_assets: List[str]) -> dict:
+    """Return a dataset copy containing only selected assets."""
+    return {
+        **dataset,
+        "assets": {
+            asset_name: dataset["assets"][asset_name]
+            for asset_name in selected_assets
+            if asset_name in dataset["assets"]
+        },
+    }
 
 
 def split_train_test_by_asset(dataset: dict, train_ratio: float = 0.8) -> dict:
@@ -97,6 +151,17 @@ def run_pipeline_collect() -> dict:
     set_reproducibility(42)
 
     dataset = collect_and_preprocess_data(start=DATA_START, end=DATA_END, time_steps=TIME_STEPS)
+    available_assets = list(dataset["assets"].keys())
+    selected_assets = pick_market_universe(
+        available_assets,
+        preferred_markets=PREFERRED_MARKETS,
+        count=MARKET_COUNT,
+    )
+    dataset = filter_dataset_assets(dataset, selected_assets)
+
+    if len(dataset["assets"]) == 0:
+        raise RuntimeError("No assets available after market selection.")
+
     split_data = split_train_test_by_asset(dataset, train_ratio=0.8)
 
     X_train = split_data["X_train"]
@@ -158,6 +223,8 @@ def run_pipeline_collect() -> dict:
     asset_confidence: Dict[str, float] = {}
     asset_volatility: Dict[str, float] = {}
     asset_outlier: Dict[str, bool] = {}
+    asset_symbol: Dict[str, str] = {}
+    asset_latest_close: Dict[str, float] = {}
     per_asset_top_features: Dict[str, List[str]] = {}
 
     background_count = min(SHAP_BACKGROUND_MAX, len(X_train_clean))
@@ -186,6 +253,8 @@ def run_pipeline_collect() -> dict:
         asset_confidence[asset_name] = confidence
         asset_volatility[asset_name] = latest_atr
         asset_outlier[asset_name] = last_outlier_flag
+        asset_symbol[asset_name] = asset_full.symbol
+        asset_latest_close[asset_name] = float(asset_full.raw_df["Close"].iloc[-1])
 
         top_features = explainer.explain_single_trade(
             X_single=X_latest,
@@ -218,9 +287,12 @@ def run_pipeline_collect() -> dict:
         rows.append(
             {
                 "asset": asset_name,
+                "symbol": asset_symbol[asset_name],
+                "latest_close": asset_latest_close[asset_name],
                 "signal": SIGNAL_NAME[asset_signals[asset_name]],
                 "signal_idx": int(asset_signals[asset_name]),
                 "confidence": float(asset_confidence[asset_name]),
+                "atr14": float(asset_volatility[asset_name]),
                 "portfolio_weight": float(weights.get(asset_name, 0.0)),
                 "outlier_flagged": bool(asset_outlier[asset_name]),
                 "top_features": per_asset_top_features[asset_name],
@@ -233,10 +305,13 @@ def run_pipeline_collect() -> dict:
         "generated_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
         "assets": rows,
         "class_weights": class_weight_dict,
+        "correlation_matrix": corr_matrix.round(4).to_dict(),
         "meta": {
             "time_steps": int(dataset["time_steps"]),
             "asset_count": int(len(rows)),
             "train_samples": int(len(X_train_clean)),
+            "selected_markets": selected_assets,
+            "available_market_count": int(len(dataset["assets"])),
         },
     }
 
@@ -244,24 +319,61 @@ def run_pipeline_collect() -> dict:
 def run_pipeline() -> None:
     """Execute ExplainInvest from data fetch to signal, allocation, and explainability output."""
     result = run_pipeline_collect()
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    report_path = REPORT_DIR / "portfolio_report.json"
+    csv_path = REPORT_DIR / "portfolio_report.csv"
+    with report_path.open("w", encoding="utf-8") as fp:
+        json.dump(result, fp, indent=2)
+    pd.DataFrame(result["assets"]).to_csv(csv_path, index=False)
+
+    active = [row for row in result["assets"] if row["portfolio_weight"] > 0]
+    strongest = active[0] if active else None
 
     class_weights = result["class_weights"]
+    print("=" * 90)
+    print("ExplainInvest Portfolio Management System")
+    print(f"Generated: {result['generated_at']}")
+    print(f"Markets:   {', '.join(result['meta']['selected_markets'])}")
+    print(f"Report:    {report_path}")
+    print(f"CSV:       {csv_path}")
+    print("=" * 90)
     print(
         f"Class weights → BUY={class_weights.get(0, 1.0):.2f}, "
         f"SELL={class_weights.get(1, 1.0):.2f}, HOLD={class_weights.get(2, 1.0):.2f}"
     )
-    print("[7/7] Final ExplainInvest output")
+    print(
+        f"[7/7] Final ExplainInvest output for {result['meta']['available_market_count']} selected markets"
+    )
 
     for row in result["assets"]:
         print("-" * 70)
         print(f"Asset:            {row['asset']}")
+        print(f"Symbol:           {row['symbol']}")
+        print(f"Latest Close:     {row['latest_close']:.5f}")
         print(f"Signal:           {row['signal']}")
         print(f"Confidence:       {row['confidence'] * 100.0:.2f}%")
+        print(f"ATR(14):          {row['atr14']:.6f}")
         print(f"Portfolio Weight: {row['portfolio_weight'] * 100.0:.2f}%")
         print(f"Outlier Flagged:  {'Yes' if row['outlier_flagged'] else 'No'}")
         print("Top 5 SHAP Features:")
         for line in row["top_features"]:
             print(f"  {line}")
+
+    print("-" * 70)
+    if strongest is not None:
+        print(
+            "Top allocation recommendation: "
+            f"{strongest['asset']} ({strongest['signal']}) at {strongest['portfolio_weight'] * 100.0:.2f}%"
+        )
+    else:
+        print("Top allocation recommendation: No active position (all markets HOLD or filtered).")
+
+    print("-" * 70)
+    print("Correlation Matrix Snapshot")
+    for asset_name in result["meta"]["selected_markets"]:
+        row = result["correlation_matrix"].get(asset_name, {})
+        formatted = ", ".join([f"{k}: {v:.2f}" for k, v in row.items()])
+        print(f"  {asset_name}: {formatted}")
 
 
 if __name__ == "__main__":

@@ -14,15 +14,34 @@ from sklearn.preprocessing import MinMaxScaler
 
 
 ASSET_SYMBOLS: Dict[str, List[str]] = {
+    # Forex
     "EUR/USD": ["EURUSD=X", "EURUSD%3DX"],
     "GBP/USD": ["GBPUSD=X", "GBPUSD%3DX"],
     "USD/JPY": ["USDJPY=X", "JPY=X"],
+    "AUD/USD": ["AUDUSD=X"],
+    "USD/CAD": ["USDCAD=X"],
+    "USD/CHF": ["USDCHF=X"],
+    "NZD/USD": ["NZDUSD=X"],
+    # Stocks
     "S&P500": ["^GSPC"],
     "NASDAQ": ["^IXIC"],
-    "BTC-USD": ["BTC-USD"],
-    "ETH-USD": ["ETH-USD"],
+    "Dow Jones": ["^DJI"],
+    "Apple": ["AAPL"],
+    "Microsoft": ["MSFT"],
+    "Tesla": ["TSLA"],
+    "NVIDIA": ["NVDA"],
+    # Commodities
     "Gold": ["GC=F"],
     "Silver": ["SI=F"],
+    "Crude Oil": ["CL=F"],
+    "Copper": ["HG=F"],
+    "Natural Gas": ["NG=F"],
+    # Crypto
+    "BTC-USD": ["BTC-USD"],
+    "ETH-USD": ["ETH-USD"],
+    "ADA-USD": ["ADA-USD"],
+    "SOL-USD": ["SOL-USD"],
+    "XRP-USD": ["XRP-USD"],
 }
 
 
@@ -282,6 +301,7 @@ def collect_and_preprocess_data(
     """Download all assets, engineer features, normalize, and create model sequences."""
     per_asset_feature_frames: Dict[str, pd.DataFrame] = {}
     per_asset_raw_frames: Dict[str, pd.DataFrame] = {}
+    per_asset_symbol_used: Dict[str, str] = {}
 
     for asset_name, symbol_candidates in ASSET_SYMBOLS.items():
         try:
@@ -295,6 +315,7 @@ def collect_and_preprocess_data(
             if len(feat_df) > time_steps + 1:
                 per_asset_raw_frames[asset_name] = feat_df.copy()
                 per_asset_feature_frames[asset_name] = feat_df[FEATURE_COLUMNS].copy()
+                per_asset_symbol_used[asset_name] = used_symbol
         except Exception as e:
             print(f"  WARNING: Failed to process {asset_name}: {e}")
             continue
@@ -331,7 +352,7 @@ def collect_and_preprocess_data(
 
         dataset = AssetDataset(
             name=asset_name,
-            symbol=used_symbol,
+            symbol=per_asset_symbol_used.get(asset_name, ""),
             raw_df=feat_df,
             scaled_df=scaled_df,
             X=X,
