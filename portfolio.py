@@ -60,8 +60,12 @@ def allocate_portfolio(
             if a_i not in correlation_matrix.index or a_j not in correlation_matrix.columns:
                 continue
 
-            corr_val = float(correlation_matrix.loc[a_i, a_j])
-            if corr_val > corr_threshold and weights[a_i] > 0 and weights[a_j] > 0:
+            corr_val = pd.to_numeric(correlation_matrix.loc[a_i, a_j], errors="coerce")
+            if pd.isna(corr_val):
+                continue
+
+            corr_float = float(corr_val)
+            if corr_float > corr_threshold and weights[a_i] > 0 and weights[a_j] > 0:
                 weights[a_i] *= 0.5
                 weights[a_j] *= 0.5
 

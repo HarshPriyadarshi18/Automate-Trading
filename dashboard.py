@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime
+from typing import Any
 from pathlib import Path
+import uuid
 
 import pandas as pd
 import streamlit as st
@@ -17,6 +19,26 @@ from main import run_pipeline_collect
 
 
 REPORT_PATH = Path("reports/portfolio_report.json")
+TRADE_LOG_PATH = Path("reports/live_trade_log.csv")
+
+TRADE_LOG_COLUMNS = [
+    "trade_id",
+    "asset",
+    "symbol",
+    "side",
+    "entry_ts_utc",
+    "entry_price",
+    "quantity",
+    "entry_confidence_pct",
+    "entry_atr",
+    "status",
+    "exit_ts_utc",
+    "exit_price",
+    "pnl",
+    "pnl_pct",
+    "outcome",
+    "close_reason",
+]
 
 SIGNAL_STYLE = {
     "BUY": {"bg": "#0f5132", "accent": "#20c997", "label": "BUY"},
@@ -37,6 +59,163 @@ def save_report(report: dict) -> None:
     with REPORT_PATH.open("w", encoding="utf-8") as fp:
         json.dump(report, fp, indent=2)
     pd.DataFrame(report.get("assets", [])).to_csv(REPORT_PATH.parent / "portfolio_report.csv", index=False)
+
+
+def load_trade_log() -> pd.DataFrame:
+    """Load paper auto-trade log from disk, creating it when missing."""
+    TRADE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not TRADE_LOG_PATH.exists():
+        pd.DataFrame(columns=TRADE_LOG_COLUMNS).to_csv(TRADE_LOG_PATH, index=False)
+    df = pd.read_csv(TRADE_LOG_PATH)
+    for col in TRADE_LOG_COLUMNS:
+        if col not in df.columns:
+            df[col] = "" if col in {"trade_id", "asset", "symbol", "side", "entry_ts_utc", "status", "exit_ts_utc", "outcome", "close_reason"} else 0.0
+    return df[TRADE_LOG_COLUMNS].copy()
+
+
+def save_trade_log(df: pd.DataFrame) -> None:
+    """Persist paper auto-trade log to disk."""
+    TRADE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(TRADE_LOG_PATH, index=False)
+
+
+def _safe_ts_utc(value: Any) -> pd.Timestamp:
+    """Normalize any timestamp-like value into tz-aware UTC timestamp."""
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if isinstance(ts, pd.Timestamp) and not pd.isna(ts):
+        return ts
+    return pd.Timestamp.now(tz="UTC")
+
+
+def _to_float(value: object, default: float = 0.0) -> float:
+    """Convert a pandas scalar or object into a plain float safely."""
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def run_auto_trade_cycle(
+    snapshot_df: pd.DataFrame,
+    live_snapshots: dict,
+    hold_minutes: int,
+    min_confidence_pct: float,
+    capital_per_trade: float,
+    close_on_timeout: bool,
+    stop_atr_mult: float,
+    target_atr_mult: float,
+    min_reversal_hold_minutes: int,
+) -> pd.DataFrame:
+    """Open/close paper trades based on live signal and evaluate decisions with future price."""
+    log_df = load_trade_log()
+
+    for _, row in snapshot_df.iterrows():
+        asset = str(row["asset"])
+        symbol = str(row["symbol"])
+        snap = live_snapshots.get(asset, {})
+        signal = str(snap.get("auto_signal", "HOLD"))
+        confidence_pct = float(snap.get("auto_confidence_pct", 0.0))
+        risk = str(row["risk"])
+        atr = float(row.get("atr14", 0.0))
+
+        quote = snap.get("quote", {})
+        live_price = float(snap.get("live_price", row.get("latest_close", 0.0)))
+        now_ts = _safe_ts_utc(quote.get("timestamp") if quote.get("timestamp") is not None else pd.Timestamp.now(tz="UTC"))
+
+        if live_price <= 0.0:
+            continue
+
+        open_mask = (log_df["asset"] == asset) & (log_df["status"] == "OPEN")
+        has_open = bool(open_mask.any())
+
+        if has_open:
+            open_idx = log_df[open_mask].index[0]
+            entry_ts = _safe_ts_utc(log_df.loc[open_idx, "entry_ts_utc"])
+            age_minutes = (now_ts - entry_ts).total_seconds() / 60.0
+
+            side = str(log_df.loc[open_idx, "side"])
+            should_close = False
+            close_reason = ""
+            entry_atr = _to_float(log_df.loc[open_idx, "entry_atr"], max(atr, 1e-6)) if "entry_atr" in log_df.columns else max(atr, 1e-6)
+            if entry_atr <= 0:
+                entry_atr = max(atr, 1e-6)
+
+            entry_price = _to_float(log_df.loc[open_idx, "entry_price"])
+            qty = _to_float(log_df.loc[open_idx, "quantity"])
+
+            if side == "BUY":
+                stop_price = entry_price - (float(stop_atr_mult) * entry_atr)
+                target_price = entry_price + (float(target_atr_mult) * entry_atr)
+                if live_price <= stop_price:
+                    should_close = True
+                    close_reason = "STOP_LOSS"
+                elif live_price >= target_price:
+                    should_close = True
+                    close_reason = "TAKE_PROFIT"
+            else:
+                stop_price = entry_price + (float(stop_atr_mult) * entry_atr)
+                target_price = entry_price - (float(target_atr_mult) * entry_atr)
+                if live_price >= stop_price:
+                    should_close = True
+                    close_reason = "STOP_LOSS"
+                elif live_price <= target_price:
+                    should_close = True
+                    close_reason = "TAKE_PROFIT"
+
+            if close_on_timeout and age_minutes >= float(hold_minutes) and not should_close:
+                should_close = True
+                close_reason = "HOLD_WINDOW_DONE"
+            elif (
+                (side == "BUY" and signal == "SELL") or (side == "SELL" and signal == "BUY")
+            ) and age_minutes >= float(min_reversal_hold_minutes) and not should_close:
+                should_close = True
+                close_reason = "SIGNAL_REVERSAL"
+
+            if should_close:
+                if side == "BUY":
+                    pnl = (live_price - entry_price) * qty
+                    pnl_pct = ((live_price / (entry_price + 1e-12)) - 1.0) * 100.0
+                    outcome = "RIGHT" if pnl > 0 else "WRONG"
+                else:
+                    pnl = (entry_price - live_price) * qty
+                    pnl_pct = ((entry_price / (live_price + 1e-12)) - 1.0) * 100.0
+                    outcome = "RIGHT" if pnl > 0 else "WRONG"
+
+                log_df.loc[open_idx, "status"] = "CLOSED"
+                log_df.loc[open_idx, "exit_ts_utc"] = now_ts.isoformat()
+                log_df.loc[open_idx, "exit_price"] = float(live_price)
+                log_df.loc[open_idx, "pnl"] = float(pnl)
+                log_df.loc[open_idx, "pnl_pct"] = float(pnl_pct)
+                log_df.loc[open_idx, "outcome"] = outcome
+                log_df.loc[open_idx, "close_reason"] = close_reason
+
+        open_mask = (log_df["asset"] == asset) & (log_df["status"] == "OPEN")
+        has_open = bool(open_mask.any())
+
+        if not has_open and signal in {"BUY", "SELL"} and confidence_pct >= float(min_confidence_pct) and risk != "High":
+            qty = float(capital_per_trade) / float(live_price)
+            new_row = {
+                "trade_id": str(uuid.uuid4()),
+                "asset": asset,
+                "symbol": symbol,
+                "side": signal,
+                "entry_ts_utc": now_ts.isoformat(),
+                "entry_price": float(live_price),
+                "quantity": float(qty),
+                "entry_confidence_pct": float(confidence_pct),
+                "entry_atr": float(max(atr, 1e-6)),
+                "status": "OPEN",
+                "exit_ts_utc": "",
+                "exit_price": 0.0,
+                "pnl": 0.0,
+                "pnl_pct": 0.0,
+                "outcome": "",
+                "close_reason": "",
+            }
+            log_df = pd.concat([log_df, pd.DataFrame([new_row])], ignore_index=True)
+
+    save_trade_log(log_df)
+    return log_df
 
 
 def rebuild_report_from_model() -> tuple[bool, str]:
@@ -321,6 +500,44 @@ def infer_live_signal(live_df: pd.DataFrame, base_signal: str, base_confidence_p
     return "HOLD", hold_conf, trend
 
 
+def infer_market_trend_signal(live_df: pd.DataFrame) -> tuple[str, float, str]:
+    """Infer a dedicated auto-trading signal from live trend only."""
+    if live_df.empty or len(live_df) < 30:
+        return "HOLD", 0.0, "Insufficient live data"
+
+    close = live_df["Close"].astype(float)
+    ema20 = close.ewm(span=20, adjust=False).mean()
+    ema50 = close.ewm(span=50, adjust=False).mean()
+
+    recent = close.tail(12)
+    start_px = float(recent.iloc[0]) if float(recent.iloc[0]) != 0.0 else 1e-6
+    short_move_pct = ((float(recent.iloc[-1]) / start_px) - 1.0) * 100.0
+
+    trend_score = 0
+    trend_score += 1 if float(ema20.iloc[-1]) > float(ema50.iloc[-1]) else -1
+    trend_score += 1 if short_move_pct > 0.10 else -1 if short_move_pct < -0.10 else 0
+
+    gap_pct = ((float(ema20.iloc[-1]) - float(ema50.iloc[-1])) / (float(ema50.iloc[-1]) + 1e-12)) * 100.0
+    confidence = min(99.0, max(55.0, 58.0 + abs(gap_pct) * 20.0 + abs(short_move_pct) * 4.0))
+
+    if short_move_pct > 0.35:
+        trend = "Strong Uptrend"
+    elif short_move_pct > 0.08:
+        trend = "Uptrend"
+    elif short_move_pct < -0.35:
+        trend = "Strong Downtrend"
+    elif short_move_pct < -0.08:
+        trend = "Downtrend"
+    else:
+        trend = "Sideways"
+
+    if trend_score >= 2:
+        return "BUY", confidence, trend
+    if trend_score <= -2:
+        return "SELL", confidence, trend
+    return "HOLD", 50.0, trend
+
+
 def enable_auto_refresh(refresh_seconds: int) -> None:
     """Auto-reload Streamlit page at a fixed interval."""
     components.html(
@@ -363,13 +580,16 @@ def main() -> None:
     auto_refresh = st.sidebar.checkbox("Auto Refresh Live", value=False)
     refresh_seconds = st.sidebar.slider("Auto refresh (sec)", min_value=10, max_value=300, value=30, step=5)
     max_lag_minutes = st.sidebar.slider("Max acceptable lag (min)", min_value=1, max_value=120, value=20, step=1)
-    live_render_mode = st.sidebar.selectbox(
-        "Live render mode",
-        options=["Focus only (fast)", "Top signals", "All filtered"],
-        index=0,
-    )
-    top_live_assets = st.sidebar.slider("Top live assets", min_value=1, max_value=10, value=4, step=1)
-
+    st.sidebar.markdown("### Auto Paper Trading")
+    auto_paper_trade = st.sidebar.checkbox("Enable Auto Paper Trade", value=True)
+    reset_trade_log = st.sidebar.button("Reset Auto Trade Log", use_container_width=True)
+    hold_minutes = st.sidebar.slider("Max hold duration (min)", min_value=5, max_value=360, value=120, step=5)
+    close_on_timeout = st.sidebar.checkbox("Force close by hold time", value=False)
+    min_reversal_hold = st.sidebar.slider("Min hold before reversal close (min)", min_value=1, max_value=120, value=10, step=1)
+    stop_atr_mult = st.sidebar.slider("Stop loss ATR x", min_value=0.5, max_value=5.0, value=1.3, step=0.1)
+    target_atr_mult = st.sidebar.slider("Take profit ATR x", min_value=0.5, max_value=6.0, value=2.1, step=0.1)
+    min_trade_conf = st.sidebar.slider("Min confidence for entry %", min_value=40, max_value=95, value=60, step=1)
+    capital_per_trade = st.sidebar.number_input("Capital per trade", min_value=100.0, max_value=50000.0, value=1000.0, step=100.0)
     cache_nonce = int(time.time() // 5)
 
     if live_refresh:
@@ -388,31 +608,36 @@ def main() -> None:
         enable_auto_refresh(refresh_seconds)
         st.sidebar.caption(f"Auto refresh active: every {refresh_seconds}s")
 
+    if reset_trade_log:
+        save_trade_log(pd.DataFrame(columns=TRADE_LOG_COLUMNS))
+        st.sidebar.success("Auto trade log reset. New entries will follow current trend strategy.")
+
     if not REPORT_PATH.exists():
         st.error("No report found. Run: python main.py")
         return
 
     report = load_report(REPORT_PATH)
     assets = report.get("assets", [])
+    selected_markets = report.get("meta", {}).get("selected_markets", [])
+    eval_summary = report.get("evaluation_summary", {})
+    calibration_summary = eval_summary.get("calibration", {}) if isinstance(eval_summary, dict) else {}
+    research_accuracy = float(calibration_summary.get("holdout_accuracy_pct", eval_summary.get("overall_accuracy_pct", 0.0)))
     if not assets:
         st.warning("Report exists, but contains no asset rows.")
         return
 
     df = pd.DataFrame(assets)
+    if selected_markets:
+        df = df[df["asset"].isin(selected_markets)].copy()
+    df = df.head(6).copy()
+
+    if len(df) < 6:
+        st.warning("Report data is stale or incomplete. Run python main.py to refresh the 6-market report.")
+        return
+
     df["risk"] = df["outlier_flagged"].map({True: "High", False: "Normal"})
     df["confidence_pct"] = (df["confidence"] * 100.0).round(2)
     df["weight_pct"] = (df["portfolio_weight"] * 100.0).round(2)
-
-    st.sidebar.markdown("### Trading Controls")
-    symbols = df["asset"].tolist()
-    selected_asset = st.sidebar.selectbox("Focus Market", options=symbols, index=0)
-    signal_filter = st.sidebar.multiselect(
-        "Signals",
-        options=["BUY", "SELL", "HOLD"],
-        default=["BUY", "SELL", "HOLD"],
-    )
-    risk_filter = st.sidebar.multiselect("Risk", options=["Normal", "High"], default=["Normal", "High"])
-    min_conf = st.sidebar.slider("Minimum Confidence %", 0, 100, 0)
 
     if not auto_refresh:
         st.sidebar.caption("Auto refresh disabled. Use Refresh Live Prices for clean updates.")
@@ -421,27 +646,8 @@ def main() -> None:
     if not rerun_on_refresh:
         st.sidebar.caption("Fast mode active: Refresh updates prices without retraining model.")
 
-    filtered = df[
-        df["signal"].isin(signal_filter)
-        & df["risk"].isin(risk_filter)
-        & (df["confidence_pct"] >= min_conf)
-    ].copy()
-
-    if filtered.empty:
-        st.warning("No markets match current filters. Relax controls in the sidebar.")
-        return
-
-    if selected_asset not in filtered["asset"].values:
-        selected_asset = filtered.iloc[0]["asset"]
-
-    if live_render_mode == "Focus only (fast)":
-        live_assets_to_fetch = {str(selected_asset)}
-    elif live_render_mode == "Top signals":
-        live_assets_to_fetch = set(
-            filtered.sort_values("confidence_pct", ascending=False)["asset"].head(int(top_live_assets)).astype(str).tolist()
-        )
-    else:
-        live_assets_to_fetch = set(filtered["asset"].astype(str).tolist())
+    filtered = df.copy()
+    live_assets_to_fetch = set(filtered["asset"].astype(str).tolist())
 
     period_value = "2d" if chart_window == "2 Days" else "3d"
 
@@ -476,6 +682,8 @@ def main() -> None:
             live_confidence_pct = float(row["confidence_pct"])
             live_trend = "Model-based"
 
+        auto_signal, auto_confidence_pct, auto_trend = infer_market_trend_signal(live_df)
+
         live_snapshots[asset_name] = {
             "live_df": live_df,
             "quote": quote,
@@ -483,6 +691,9 @@ def main() -> None:
             "live_signal": live_signal,
             "live_confidence_pct": live_confidence_pct,
             "live_trend": live_trend,
+            "auto_signal": auto_signal,
+            "auto_confidence_pct": auto_confidence_pct,
+            "auto_trend": auto_trend,
         }
 
     filtered["live_signal"] = filtered["asset"].map(lambda x: live_snapshots[str(x)]["live_signal"])
@@ -492,7 +703,31 @@ def main() -> None:
     filtered["live_price"] = filtered["asset"].map(lambda x: float(live_snapshots[str(x)]["live_price"]))
     filtered["live_trend"] = filtered["asset"].map(lambda x: live_snapshots[str(x)]["live_trend"])
 
-    focus = filtered[filtered["asset"] == selected_asset].iloc[0]
+    trade_log_df = load_trade_log()
+    if auto_paper_trade:
+        trade_log_df = run_auto_trade_cycle(
+            snapshot_df=filtered,
+            live_snapshots=live_snapshots,
+            hold_minutes=int(hold_minutes),
+            min_confidence_pct=float(min_trade_conf),
+            capital_per_trade=float(capital_per_trade),
+            close_on_timeout=bool(close_on_timeout),
+            stop_atr_mult=float(stop_atr_mult),
+            target_atr_mult=float(target_atr_mult),
+            min_reversal_hold_minutes=int(min_reversal_hold),
+        )
+
+    closed_trades = trade_log_df[trade_log_df["status"] == "CLOSED"].copy()
+    open_trades = trade_log_df[trade_log_df["status"] == "OPEN"].copy()
+    realized_pnl = float(pd.to_numeric(closed_trades["pnl"], errors="coerce").fillna(0.0).sum()) if not closed_trades.empty else 0.0
+    closed_count = int(len(closed_trades))
+    right_count = int(closed_trades["outcome"].eq("RIGHT").sum()) if not closed_trades.empty else 0
+    wrong_count = int(closed_trades["outcome"].eq("WRONG").sum()) if not closed_trades.empty else 0
+    decision_accuracy = (right_count / closed_count * 100.0) if closed_count > 0 else 0.0
+    right_accuracy_pct = (right_count / closed_count * 100.0) if closed_count > 0 else 0.0
+    wrong_accuracy_pct = (wrong_count / closed_count * 100.0) if closed_count > 0 else 0.0
+
+    focus = filtered.iloc[0]
     signal_info = SIGNAL_STYLE.get(str(focus["live_signal"]), SIGNAL_STYLE["HOLD"])
     focus_for_plan = focus.copy()
     focus_for_plan["signal"] = focus["live_signal"]
@@ -506,6 +741,17 @@ def main() -> None:
     m2.metric("BUY", buy_count)
     m3.metric("SELL", sell_count)
     m4.metric("HOLD", hold_count)
+
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Auto Open Positions", int(len(open_trades)))
+    a2.metric("Auto Closed Trades", closed_count)
+    a3.metric("Auto Realized PnL", f"{realized_pnl:+.2f}")
+    a4.metric("Decision Accuracy", f"{decision_accuracy:.2f}%")
+
+    e1, e2, e3 = st.columns(3)
+    e1.metric("Model Samples", int(eval_summary.get("samples", 0)))
+    e2.metric("Prediction Accuracy", f"{float(eval_summary.get('overall_accuracy_pct', 0.0)):.2f}%")
+    e3.metric("Active Trade Accuracy", f"{float(eval_summary.get('active_trade_accuracy_pct', 0.0)):.2f}%")
 
     left, right = st.columns([2.3, 1.2])
 
@@ -565,7 +811,9 @@ def main() -> None:
             "live_trend",
             "atr14",
             "weight_pct",
+            "test_accuracy_pct",
             "risk",
+            "decision_reason",
         ]
     ].rename(
         columns={
@@ -577,10 +825,85 @@ def main() -> None:
             "live_trend": "Trend",
             "atr14": "ATR14",
             "weight_pct": "Allocation %",
+            "test_accuracy_pct": "Test Accuracy %",
             "risk": "Risk",
+            "decision_reason": "Reason",
         }
     )
     st.dataframe(board.sort_values("Allocation %", ascending=False), use_container_width=True, hide_index=True)
+
+    st.markdown("### Auto Trade Journal")
+    if closed_trades.empty and open_trades.empty:
+        st.info("No auto paper trades yet. Keep Auto Paper Trade enabled and refresh live data.")
+    else:
+        if not open_trades.empty:
+            st.markdown("Open Positions")
+            st.dataframe(
+                open_trades[
+                    [
+                        "asset",
+                        "symbol",
+                        "side",
+                        "entry_price",
+                        "entry_confidence_pct",
+                        "entry_ts_utc",
+                    ]
+                ].rename(
+                    columns={
+                        "asset": "Market",
+                        "symbol": "Ticker",
+                        "side": "Side",
+                        "entry_price": "Entry",
+                        "entry_confidence_pct": "Confidence %",
+                        "entry_ts_utc": "Entry Time (UTC)",
+                    }
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+
+        if not closed_trades.empty:
+            st.markdown("Closed Positions (Right/Wrong + Profit)")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("RIGHT Decisions", right_count, f"{right_accuracy_pct:.2f}%")
+            c2.metric("Decision Accuracy", f"{decision_accuracy:.2f}%")
+            c3.metric("Research Accuracy", f"{research_accuracy:.2f}%")
+            closed_view = closed_trades.copy()
+            closed_view["pnl"] = pd.to_numeric(closed_view["pnl"], errors="coerce").fillna(0.0)
+            closed_view["pnl_pct"] = pd.to_numeric(closed_view["pnl_pct"], errors="coerce").fillna(0.0)
+            st.dataframe(
+                closed_view.sort_values("exit_ts_utc", ascending=False)[
+                    [
+                        "asset",
+                        "symbol",
+                        "side",
+                        "entry_price",
+                        "exit_price",
+                        "pnl",
+                        "pnl_pct",
+                        "outcome",
+                        "close_reason",
+                        "entry_ts_utc",
+                        "exit_ts_utc",
+                    ]
+                ].rename(
+                    columns={
+                        "asset": "Market",
+                        "symbol": "Ticker",
+                        "side": "Side",
+                        "entry_price": "Entry",
+                        "exit_price": "Exit",
+                        "pnl": "Profit",
+                        "pnl_pct": "Profit %",
+                        "outcome": "Decision",
+                        "close_reason": "Closed By",
+                        "entry_ts_utc": "Entry Time (UTC)",
+                        "exit_ts_utc": "Exit Time (UTC)",
+                    }
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
 
     st.markdown("### Live Market Movement")
     movement_assets = filtered[filtered["asset"].astype(str).isin(live_assets_to_fetch)][
@@ -730,6 +1053,7 @@ def main() -> None:
         with st.expander(
             f"{row['asset']} | Base Model: {row['signal']} ({row['confidence_pct']:.2f}%) | Live: {row['live_signal']} ({row['live_confidence_pct']:.2f}%)"
         ):
+            st.write(f"Reason: {row.get('decision_reason', 'N/A')}")
             for line in row["top_features"]:
                 st.write(f"- {line}")
 

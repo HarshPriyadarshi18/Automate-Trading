@@ -2,15 +2,36 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List
+import warnings
 
 import numpy as np
 import pandas as pd
 import ta
 import yfinance as yf
 from sklearn.preprocessing import MinMaxScaler
+from ta.momentum import rsi
+from ta.trend import macd, macd_signal
+from ta.volatility import BollingerBands, average_true_range
+
+
+warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
+logging.getLogger("yfinance").setLevel(logging.ERROR)
+logging.getLogger("yfinance.shared").setLevel(logging.ERROR)
+
+
+def _quiet_download(*args, **kwargs) -> pd.DataFrame:
+    """Run yfinance downloads without surfacing warning noise to stdout/stderr."""
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        downloaded = yf.download(*args, **kwargs)
+    if isinstance(downloaded, pd.DataFrame):
+        return downloaded
+    return pd.DataFrame()
 
 
 ASSET_SYMBOLS: Dict[str, List[str]] = {
@@ -96,7 +117,7 @@ def _download_interval_chunks(
     while cursor < end_dt:
         chunk_end = min(cursor + timedelta(days=chunk_days), end_dt)
         try:
-            df_chunk = yf.download(
+            df_chunk = _quiet_download(
                 symbol,
                 start=cursor.strftime("%Y-%m-%d"),
                 end=chunk_end.strftime("%Y-%m-%d"),
@@ -123,7 +144,11 @@ def _download_interval_chunks(
     return df
 
 
-def _download_symbol_with_fallbacks(symbol_candidates: List[str], start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DataFrame:
+def _download_symbol_with_fallbacks(
+    symbol_candidates: List[str],
+    start_dt: pd.Timestamp,
+    end_dt: pd.Timestamp,
+) -> tuple[pd.DataFrame, str]:
     """Try multiple ticker symbols and return the first non-empty dataset."""
     for symbol in symbol_candidates:
         df = _download_market_data(symbol=symbol, start=start_dt.strftime("%Y-%m-%d"), end=end_dt.strftime("%Y-%m-%d"))
@@ -133,12 +158,7 @@ def _download_symbol_with_fallbacks(symbol_candidates: List[str], start_dt: pd.T
 
 
 def _download_market_data(symbol: str, start: str, end: str) -> pd.DataFrame:
-    """Download market data with retry and safe fallback for Yahoo intraday history limits.
 
-    Yahoo Finance limits 1-hour data to roughly the last 730 days. This function
-    fetches older history with daily bars and the recent window with hourly bars.
-    Includes retry logic to handle transient API failures.
-    """
     import time
     
     start_dt = pd.Timestamp(start)
@@ -190,6 +210,8 @@ def _download_market_data(symbol: str, start: str, end: str) -> pd.DataFrame:
             else:
                 return pd.DataFrame()
 
+    return pd.DataFrame()
+
 
 def _download_market_data_for_candidates(symbol_candidates: List[str], start: str, end: str) -> tuple[pd.DataFrame, str]:
     """Download market data by probing multiple ticker candidates."""
@@ -237,18 +259,18 @@ def _engineer_features(df: pd.DataFrame) -> pd.DataFrame:
 
     feat["Avg_Price"] = (feat["Open"] + feat["High"] + feat["Low"] + feat["Close"]) / 4.0
     feat["Volume_MA20"] = feat["Volume"].rolling(20, min_periods=1).mean()
-    feat["RSI14"] = ta.momentum.rsi(feat["Close"], window=14, fillna=True)
-    feat["MACD"] = ta.trend.macd(feat["Close"], fillna=True)
-    feat["MACD_Signal"] = ta.trend.macd_signal(feat["Close"], fillna=True)
+    feat["RSI14"] = rsi(feat["Close"], window=14, fillna=True)
+    feat["MACD"] = macd(feat["Close"], fillna=True)
+    feat["MACD_Signal"] = macd_signal(feat["Close"], fillna=True)
     feat["MA20"] = feat["Close"].rolling(20, min_periods=1).mean()
     feat["MA50"] = feat["Close"].rolling(50, min_periods=1).mean()
     feat["MA100"] = feat["Close"].rolling(100, min_periods=1).mean()
     feat["MA200"] = feat["Close"].rolling(200, min_periods=1).mean()
-    feat["ATR14"] = ta.volatility.average_true_range(
+    feat["ATR14"] = average_true_range(
         feat["High"], feat["Low"], feat["Close"], window=14, fillna=True
     )
 
-    bb = ta.volatility.BollingerBands(close=feat["Close"], window=20, window_dev=2, fillna=True)
+    bb = BollingerBands(close=feat["Close"], window=20, window_dev=2, fillna=True)
     feat["Bollinger_Upper"] = bb.bollinger_hband()
     feat["Bollinger_Lower"] = bb.bollinger_lband()
 
@@ -325,7 +347,7 @@ def collect_and_preprocess_data(
 
     # Fit a global scaler across all assets to keep a shared 0-1 feature range.
     stacked = pd.concat(per_asset_feature_frames.values(), axis=0)
-    scaler = MinMaxScaler(feature_range=(0.0, 1.0))
+    scaler = MinMaxScaler(feature_range=(0, 1))
     scaler.fit(stacked.values)
 
     asset_datasets: Dict[str, AssetDataset] = {}

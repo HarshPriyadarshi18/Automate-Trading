@@ -1,0 +1,18 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run Dashboard (venv)",
+			"type": "shell",
+			"command": "c:/Users/hpriy/OneDrive/Desktop/automateTrade/.venv/Scripts/python.exe",
+			"args": [
+				"-m",
+				"streamlit",
+				"run",
+				"dashboard.py"
+			],
+			"isBackground": true,
+			"group": "build"
+		}
+	]
+}

@@ -57,4 +57,24 @@ def generate_pseudo_labels(
         dtype=np.int32,
     )
 
+    # If any class collapses to zero, fall back to a return-quantile split so the
+    # model always sees BUY, SELL, and HOLD examples during training.
+    clean_labels = labels[clean_mask]
+    class_counts = np.bincount(clean_labels, minlength=3)
+    class_total = int(np.sum(class_counts))
+    class_shares = class_counts / class_total if class_total > 0 else np.zeros_like(class_counts, dtype=np.float32)
+    if np.any(class_counts == 0) or float(np.min(class_shares)) < 0.15:
+        lower_q, upper_q = np.quantile(clean_returns, [0.33, 0.67])
+        quantile_labels = np.full(shape=(len(clean_returns),), fill_value=2, dtype=np.int32)
+        quantile_labels[clean_returns <= lower_q] = 1
+        quantile_labels[clean_returns >= upper_q] = 0
+        labels[clean_mask] = quantile_labels
+
+        # As a second pass, make sure SELL exists even in strongly trending windows.
+        clean_labels = labels[clean_mask]
+        class_counts = np.bincount(clean_labels, minlength=3)
+        if class_counts[1] == 0 and len(clean_returns) > 0:
+            worst_idx = int(np.argmin(clean_returns))
+            labels[np.where(clean_mask)[0][worst_idx]] = 1
+
     return labels, kmeans, cluster_to_label

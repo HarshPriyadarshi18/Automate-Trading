@@ -32,8 +32,8 @@ def build_cnn_lstm_attention_model(
     model = tf.keras.Model(inputs=inp, outputs=out)
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-        loss="categorical_crossentropy",
-        metrics=["accuracy"],
+        loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.02),
+        metrics=[tf.keras.metrics.CategoricalAccuracy(name="accuracy")],
     )
     return model
 
@@ -46,15 +46,25 @@ def train_trading_model(
     batch_size: int = 32,
     validation_split: float = 0.2,
     class_weight: Optional[Dict[int, float]] = None,
+    early_stopping_patience: int = 8,
+    min_delta: float = 1e-4,
 ) -> tf.keras.callbacks.History:
     """Train the model with one-hot labels and early stopping to reduce overfitting."""
     y_cat = tf.keras.utils.to_categorical(y_train, num_classes=3)
     callbacks = [
         tf.keras.callbacks.EarlyStopping(
             monitor="val_loss",
-            patience=5,
+            patience=early_stopping_patience,
+            min_delta=min_delta,
             restore_best_weights=True,
-        )
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=max(2, early_stopping_patience // 2),
+            min_lr=1e-5,
+            verbose=1,
+        ),
     ]
 
     history = model.fit(

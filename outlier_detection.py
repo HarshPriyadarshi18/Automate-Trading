@@ -61,7 +61,7 @@ class ThreeLayerOutlierDetector:
 
     def fit(self, X_flat: np.ndarray, epochs: int = 40, batch_size: int = 64) -> None:
         """Fit autoencoder and isolation forest on nominal training samples."""
-        callbacks = [
+        callbacks: list[tf.keras.callbacks.Callback] = [
             tf.keras.callbacks.EarlyStopping(
                 monitor="val_loss",
                 patience=5,
@@ -97,9 +97,13 @@ class ThreeLayerOutlierDetector:
         iso_pred = self.isolation_forest.predict(X_flat)
         iso_flag = iso_pred == -1
 
-        atr_series = pd.Series(atr_values)
-        atr_roll_mean = atr_series.rolling(window=self.atr_window, min_periods=1).mean().values
-        atr_flag = atr_values > (self.atr_multiplier * atr_roll_mean)
+        atr_arr = np.asarray(atr_values, dtype=np.float32)
+        atr_series = pd.Series(atr_arr)
+        atr_roll_mean = np.asarray(
+            atr_series.rolling(window=self.atr_window, min_periods=1).mean().values,
+            dtype=np.float32,
+        )
+        atr_flag = atr_arr > (self.atr_multiplier * atr_roll_mean)
 
         combined = ae_flag | iso_flag | atr_flag
 
